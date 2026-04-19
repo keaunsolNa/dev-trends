@@ -2,15 +2,20 @@
 Daily Dev Community Trends fetcher.
 
 Sources:
-  - Reddit r/programming (hot, JSON)
+  - Hacker News top stories (Firebase API, no auth)
   - Stack Overflow (Stack Exchange API, hot)
   - GitHub Discussions (GraphQL search)
 
 Pipeline: fetch -> score -> pick top N -> translate (DeepL -> Google) -> MD -> Slack.
 Designed to be idempotent per day and resilient to single-source failures.
+
+NOTE: Reddit source removed pending Reddit Data API approval (post-2024 policy).
+      To restore Reddit: re-add fetch_reddit() with OAuth2 client_credentials flow
+      and append 'reddit' to the sources dict in main().
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import math
 import os
@@ -36,8 +41,10 @@ SO_KEY = os.getenv("STACK_EXCHANGE_KEY")  # optional, raises daily quota
 USER_AGENT = "dev-trends-bot/1.0 (by GitHub Actions)"
 HEADERS_COMMON = {"User-Agent": USER_AGENT}
 
+HN_API_BASE = "https://hacker-news.firebaseio.com/v0"
+
 SOURCE_LABEL = {
-    "reddit": "Reddit",
+    "hackernews": "Hacker News",
     "stackoverflow": "Stack Overflow",
     "github": "GitHub Discussions",
 }
@@ -48,37 +55,67 @@ log = logging.getLogger("trends")
 
 # ---------------- scoring ----------------
 def unified_score(upvotes: int, comments: int, views: Optional[int] = None) -> float:
-    """Log-scale weighted score. Comments weighted highest (signal > noise)."""
-    s = math.log10(upvotes + 1) * 1.0 + math.log10(comments + 1) * 1.5
-    if views and views > 0:
-        s += math.log10(views + 1) * 0.3
+    """Log-scale weighted score. Negatives clamped to 0."""
+    u = max(upvotes or 0, 0)
+    c = max(comments or 0, 0)
+    v = max(views or 0, 0)
+    s = math.log10(u + 1) * 1.0 + math.log10(c + 1) * 1.5
+    if v > 0:
+        s += math.log10(v + 1) * 0.3
     return s
 
 
 # ---------------- sources ----------------
-def fetch_reddit(limit: int = 25) -> list[dict]:
-    url = "https://www.reddit.com/r/programming/hot.json"
+def _fetch_hn_item(item_id: int) -> Optional[dict]:
     try:
-        r = requests.get(url, headers=HEADERS_COMMON, params={"limit": limit}, timeout=15)
+        r = requests.get(f"{HN_API_BASE}/item/{item_id}.json", timeout=10)
         r.raise_for_status()
-        data = r.json()
+        return r.json()
     except Exception as e:
-        log.warning("reddit fetch failed: %s", e)
+        log.warning("hn item %s fetch failed: %s", item_id, e)
+        return None
+
+
+def fetch_hackernews(limit: int = 25, pool: int = 50) -> list[dict]:
+    """
+    Top `limit` HN stories from the front page.
+    Fetches top `pool` IDs then filters to type=story (drops jobs/dead/deleted).
+    """
+    try:
+        r = requests.get(f"{HN_API_BASE}/topstories.json", timeout=15)
+        r.raise_for_status()
+        ids = r.json()[:pool]
+    except Exception as e:
+        log.warning("hn topstories fetch failed: %s", e)
         return []
-    items = []
-    for child in data.get("data", {}).get("children", []):
-        d = child.get("data", {})
-        if d.get("stickied"):
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=10) as ex:
+        results = list(ex.map(_fetch_hn_item, ids))
+
+    items: list[dict] = []
+    for result in results:
+        if not result:
             continue
+        if result.get("type") != "story":
+            continue
+        if result.get("dead") or result.get("deleted"):
+            continue
+        hn_id = result.get("id")
+        title = result.get("title", "")
+        score = result.get("score", 0) or 0
+        comments = result.get("descendants", 0) or 0
+        hn_url = f"https://news.ycombinator.com/item?id={hn_id}"
         items.append({
-            "source": "reddit",
-            "title": d.get("title", ""),
-            "url": "https://www.reddit.com" + d.get("permalink", ""),
-            "upvotes": d.get("ups", 0) or 0,
-            "comments": d.get("num_comments", 0) or 0,
-            "views": d.get("view_count") or 0,
-            "meta": f"r/programming · ↑{d.get('ups', 0)} · 💬{d.get('num_comments', 0)}",
+            "source": "hackernews",
+            "title": title,
+            "url": hn_url,  # link to discussion (external URL reachable from there)
+            "upvotes": score,
+            "comments": comments,
+            "views": 0,
+            "meta": f"HN · ↑{score} · 💬{comments}",
         })
+        if len(items) >= limit:
+            break
     return items
 
 
@@ -199,13 +236,14 @@ def pick_top(items_by_source: dict[str, list[dict]]) -> list[dict]:
     selected: list[dict] = []
     seen_urls: set[str] = set()
     used_sources: set[str] = set()
+    non_empty_sources = sum(1 for v in items_by_source.values() if v)
     for item in pool:
         if item["source"] in used_sources or item["url"] in seen_urls:
             continue
         selected.append(item)
         seen_urls.add(item["url"])
         used_sources.add(item["source"])
-        if len(used_sources) >= sum(1 for v in items_by_source.values() if v):
+        if len(used_sources) >= non_empty_sources:
             break
 
     # Step 2: fill remaining slots by overall score.
@@ -272,7 +310,7 @@ def build_markdown(items: list[dict]) -> str:
         f"# 개발자 커뮤니티 트렌드 — {date_str}",
         "",
         f"> **생성일시**: {TODAY_KST.strftime('%Y-%m-%d %H:%M KST')}",
-        "> **소스**: Reddit r/programming · Stack Overflow · GitHub Discussions",
+        "> **소스**: Hacker News · Stack Overflow · GitHub Discussions",
         "> **선정 기준**: 조회·추천·댓글 가중 log-scale 점수",
         "",
         "---",
@@ -335,7 +373,7 @@ def write_report(md: str) -> Path:
 def main() -> int:
     log.info("fetching sources...")
     sources = {
-        "reddit": fetch_reddit(),
+        "hackernews": fetch_hackernews(),
         "stackoverflow": fetch_stackoverflow(),
         "github": fetch_github_discussions(),
     }
