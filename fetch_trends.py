@@ -1,24 +1,23 @@
 """
-Daily Dev Community Trends fetcher.
+Daily Dev Community Trends fetcher (extractive summary, no LLM cost).
 
 Sources:
-  - Hacker News top stories (Firebase API, no auth)
+  - Hacker News top stories (Firebase API)
   - Stack Overflow (Stack Exchange API, hot)
   - GitHub Discussions (GraphQL search)
 
-Pipeline: fetch -> score -> pick top N -> translate (DeepL -> Google) -> MD -> Slack.
-Designed to be idempotent per day and resilient to single-source failures.
-
-NOTE: Reddit source removed pending Reddit Data API approval (post-2024 policy).
-      To restore Reddit: re-add fetch_reddit() with OAuth2 client_credentials flow
-      and append 'reddit' to the sources dict in main().
+Summarization: extract first N meaningful sentences -> translate via DeepL.
+To upgrade to LLM-based summary later, replace _build_summary() body
+with a call to an LLM API (see commented _summarize_with_llm template).
 """
 from __future__ import annotations
 
 import concurrent.futures
+import html as html_mod
 import logging
 import math
 import os
+import re
 import sys
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -31,17 +30,20 @@ KST = timezone(timedelta(hours=9))
 TODAY_KST = datetime.now(KST)
 REPORT_DIR = Path("reports")
 TOP_N = 5
-PER_SOURCE_POOL = 3  # top-k per source before merging
+PER_SOURCE_POOL = 3
 
 DEEPL_KEY = os.getenv("DEEPL_API_KEY")
 GH_TOKEN = os.getenv("GH_API_TOKEN")
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK_URL")
-SO_KEY = os.getenv("STACK_EXCHANGE_KEY")  # optional, raises daily quota
+SO_KEY = os.getenv("STACK_EXCHANGE_KEY")
 
 USER_AGENT = "dev-trends-bot/1.0 (by GitHub Actions)"
 HEADERS_COMMON = {"User-Agent": USER_AGENT}
 
 HN_API_BASE = "https://hacker-news.firebaseio.com/v0"
+SUMMARY_MAX_CHARS = 300  # final Korean output cap
+EXTRACT_MAX_CHARS = 500  # cap for DeepL input (saves quota)
+EXTRACT_MAX_SENTENCES = 3
 
 SOURCE_LABEL = {
     "hackernews": "Hacker News",
@@ -53,15 +55,25 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(mess
 log = logging.getLogger("trends")
 
 
-# ---------------- scoring ----------------
+# ---------------- utilities ----------------
 def unified_score(upvotes: int, comments: int, views: Optional[int] = None) -> float:
-    """Log-scale weighted score. Negatives clamped to 0."""
     u = max(upvotes or 0, 0)
     c = max(comments or 0, 0)
     v = max(views or 0, 0)
     s = math.log10(u + 1) * 1.0 + math.log10(c + 1) * 1.5
     if v > 0:
         s += math.log10(v + 1) * 0.3
+    return s
+
+
+def strip_html(s: str) -> str:
+    if not s:
+        return ""
+    s = re.sub(r"<pre>.*?</pre>", " ", s, flags=re.DOTALL | re.IGNORECASE)
+    s = re.sub(r"<code>.*?</code>", " ", s, flags=re.DOTALL | re.IGNORECASE)
+    s = re.sub(r"<[^>]+>", " ", s)
+    s = html_mod.unescape(s)
+    s = re.sub(r"\s+", " ", s).strip()
     return s
 
 
@@ -76,11 +88,21 @@ def _fetch_hn_item(item_id: int) -> Optional[dict]:
         return None
 
 
+def _hn_body(item: dict) -> str:
+    """Self-post text, or first top-level comment, or ''."""
+    text = strip_html(item.get("text") or "")
+    if text:
+        return text
+    kids = item.get("kids") or []
+    if not kids:
+        return ""
+    top = _fetch_hn_item(kids[0])
+    if top and top.get("text"):
+        return strip_html(top["text"])
+    return ""
+
+
 def fetch_hackernews(limit: int = 25, pool: int = 50) -> list[dict]:
-    """
-    Top `limit` HN stories from the front page.
-    Fetches top `pool` IDs then filters to type=story (drops jobs/dead/deleted).
-    """
     try:
         r = requests.get(f"{HN_API_BASE}/topstories.json", timeout=15)
         r.raise_for_status()
@@ -108,11 +130,12 @@ def fetch_hackernews(limit: int = 25, pool: int = 50) -> list[dict]:
         items.append({
             "source": "hackernews",
             "title": title,
-            "url": hn_url,  # link to discussion (external URL reachable from there)
+            "url": hn_url,
             "upvotes": score,
             "comments": comments,
             "views": 0,
             "meta": f"HN · ↑{score} · 💬{comments}",
+            "_raw": result,  # defer body extraction until selected
         })
         if len(items) >= limit:
             break
@@ -126,6 +149,7 @@ def fetch_stackoverflow(limit: int = 25) -> list[dict]:
         "sort": "hot",
         "site": "stackoverflow",
         "pagesize": limit,
+        "filter": "withbody",
     }
     if SO_KEY:
         params["key"] = SO_KEY
@@ -138,6 +162,7 @@ def fetch_stackoverflow(limit: int = 25) -> list[dict]:
         return []
     items = []
     for q in data.get("items", []):
+        body = strip_html(q.get("body", ""))
         items.append({
             "source": "stackoverflow",
             "title": q.get("title", ""),
@@ -149,15 +174,12 @@ def fetch_stackoverflow(limit: int = 25) -> list[dict]:
                 f"SO · ↑{q.get('score', 0)} · ✅{q.get('answer_count', 0)} "
                 f"· 👀{q.get('view_count', 0)}"
             ),
+            "body": body,
         })
     return items
 
 
 def fetch_github_discussions(limit: int = 25) -> list[dict]:
-    """
-    Public Discussions with high engagement via GraphQL search.
-    Filter: updated in last 3 days, >=20 comments.
-    """
     if not GH_TOKEN:
         log.warning("GH_API_TOKEN missing; skipping GitHub Discussions")
         return []
@@ -170,6 +192,7 @@ def fetch_github_discussions(limit: int = 25) -> list[dict]:
           ... on Discussion {
             title
             url
+            bodyText
             upvoteCount
             comments { totalCount }
             repository { nameWithOwner }
@@ -205,6 +228,7 @@ def fetch_github_discussions(limit: int = 25) -> list[dict]:
         repo = (node.get("repository") or {}).get("nameWithOwner", "")
         upv = node.get("upvoteCount", 0) or 0
         cmt = (node.get("comments") or {}).get("totalCount", 0) or 0
+        body = (node.get("bodyText") or "").strip()
         items.append({
             "source": "github",
             "title": node.get("title", ""),
@@ -213,6 +237,7 @@ def fetch_github_discussions(limit: int = 25) -> list[dict]:
             "comments": cmt,
             "views": 0,
             "meta": f"{repo} · ↑{upv} · 💬{cmt}",
+            "body": body,
         })
     return items
 
@@ -232,7 +257,6 @@ def pick_top(items_by_source: dict[str, list[dict]]) -> list[dict]:
         reverse=True,
     )
 
-    # Step 1: guarantee at least one per non-empty source if possible.
     selected: list[dict] = []
     seen_urls: set[str] = set()
     used_sources: set[str] = set()
@@ -245,8 +269,6 @@ def pick_top(items_by_source: dict[str, list[dict]]) -> list[dict]:
         used_sources.add(item["source"])
         if len(used_sources) >= non_empty_sources:
             break
-
-    # Step 2: fill remaining slots by overall score.
     for item in pool:
         if len(selected) >= TOP_N:
             break
@@ -254,8 +276,67 @@ def pick_top(items_by_source: dict[str, list[dict]]) -> list[dict]:
             continue
         selected.append(item)
         seen_urls.add(item["url"])
-
     return selected[:TOP_N]
+
+
+# ---------------- summarization (extractive, no LLM) ----------------
+def _resolve_body(item: dict) -> str:
+    """Lazily resolve body. For HN, may fetch a comment."""
+    if "body" in item and item["body"] is not None:
+        return item["body"]
+    if item["source"] == "hackernews" and "_raw" in item:
+        body = _hn_body(item["_raw"])
+        item["body"] = body
+        return body
+    return ""
+
+
+def _extract_first_sentences(body: str) -> str:
+    """Take first N meaningful sentences, drop code-ish/URL-only lines."""
+    if not body:
+        return ""
+    text = re.sub(r"\s+", " ", body).strip()
+    # split on sentence terminators + whitespace
+    raw = re.split(r"(?<=[.!?])\s+", text)
+    picked: list[str] = []
+    for s in raw:
+        s = s.strip()
+        if len(s) < 20:
+            continue
+        # drop pure URL/code-like fragments
+        if s.startswith(("http://", "https://", "$ ", "> ", "```")):
+            continue
+        # drop lines that are mostly non-alpha (e.g., stack traces, tables)
+        alpha = sum(1 for c in s if c.isalpha())
+        if alpha / max(len(s), 1) < 0.5:
+            continue
+        picked.append(s)
+        if len(picked) >= EXTRACT_MAX_SENTENCES:
+            break
+    out = " ".join(picked)
+    if len(out) > EXTRACT_MAX_CHARS:
+        out = out[: EXTRACT_MAX_CHARS - 3].rsplit(" ", 1)[0] + "..."
+    return out
+
+
+def _build_summary(item: dict) -> Optional[str]:
+    """Extract + translate. Returns None if body is empty."""
+    body = _resolve_body(item).strip()
+    if not body:
+        return None
+    extract = _extract_first_sentences(body)
+    if not extract:
+        return None
+    translated = translate(extract)
+    if len(translated) > SUMMARY_MAX_CHARS:
+        translated = translated[: SUMMARY_MAX_CHARS - 3].rsplit(" ", 1)[0] + "..."
+    return translated
+
+
+def summarize_items(items: list[dict]) -> None:
+    for it in items:
+        summary = _build_summary(it)
+        it["summary"] = summary or "(본문 없음 — 원문 링크 참조)"
 
 
 # ---------------- translation ----------------
@@ -312,6 +393,7 @@ def build_markdown(items: list[dict]) -> str:
         f"> **생성일시**: {TODAY_KST.strftime('%Y-%m-%d %H:%M KST')}",
         "> **소스**: Hacker News · Stack Overflow · GitHub Discussions",
         "> **선정 기준**: 조회·추천·댓글 가중 log-scale 점수",
+        "> **요약 방식**: 본문 첫 문장 추출 + DeepL 번역 (LLM 미사용)",
         "",
         "---",
         "",
@@ -325,6 +407,7 @@ def build_markdown(items: list[dict]) -> str:
             f"- **원제**: {it['title']}",
             f"- **지표**: {it['meta']}",
             f"- **링크**: {it['url']}",
+            f"- **요약**: {it.get('summary', '')}",
             "",
         ])
     return "\n".join(lines)
@@ -345,11 +428,16 @@ def post_to_slack(items: list[dict]) -> None:
     for i, it in enumerate(items, 1):
         title_ko = translate(it["title"])
         label = SOURCE_LABEL.get(it["source"], it["source"])
+        summary = it.get("summary", "")
         blocks.append({
             "type": "section",
             "text": {
                 "type": "mrkdwn",
-                "text": f"*{i}. [{label}]* <{it['url']}|{title_ko}>\n  _{it['meta']}_",
+                "text": (
+                    f"*{i}. [{label}]* <{it['url']}|{title_ko}>\n"
+                    f"  _{it['meta']}_\n"
+                    f"  📝 {summary}"
+                ),
             },
         })
     payload = {"text": f"개발자 커뮤니티 트렌드 — {date_str}", "blocks": blocks}
@@ -367,6 +455,18 @@ def write_report(md: str) -> Path:
     path.write_text(md, encoding="utf-8")
     log.info("wrote %s", path)
     return path
+
+
+# ---------------- upgrade path ----------------
+# To switch to LLM-based abstractive summary later:
+#   1) Add ANTHROPIC_API_KEY (or OPENAI_API_KEY) to secrets & workflow env
+#   2) Replace _build_summary() with a call to the LLM
+#   3) Example stub below.
+#
+# def _summarize_with_llm(title, body, label) -> Optional[str]:
+#     # POST to https://api.anthropic.com/v1/messages with model claude-haiku-4-5
+#     # and a prompt requesting a ~300-char Korean summary.
+#     ...
 
 
 # ---------------- main ----------------
@@ -389,6 +489,9 @@ def main() -> int:
     if not top:
         log.error("nothing selected")
         return 1
+
+    log.info("summarizing top %d (extractive)...", len(top))
+    summarize_items(top)
 
     md = build_markdown(top)
     write_report(md)
