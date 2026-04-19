@@ -10,7 +10,6 @@ permissions:
   contents: write
 
 env:
-  # 2026-06-02부터 Node 20이 deprecated. 선제 대응.
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
 
 jobs:
@@ -36,10 +35,8 @@ jobs:
           GH_API_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
           STACK_EXCHANGE_KEY: ${{ secrets.STACK_EXCHANGE_KEY }}
-          # Reddit secrets removed. Re-add when Reddit Data API approval is granted:
-          #   REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
-          #   REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
-          #   REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
+          # Upgrade path: LLM-based summary
+          #   ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python fetch_trends.py
 
       - name: Commit report
