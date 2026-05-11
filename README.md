@@ -1,6 +1,8 @@
 # dev-trends
 
-매일 08:00 KST에 Reddit · Stack Overflow · GitHub Discussions에서 가장 반응 많은 글 5개를 수집, 한글 번역 후 Slack에 전송하고 `reports/YYYY-MM-DD.md`로 커밋합니다.
+매일 08:00 KST에 **Hacker News · Stack Overflow · GitHub Discussions**에서 가장 반응 많은 글 5개를 수집, 한글 번역 후 Slack에 전송하고 `reports/YYYY-MM-DD.md`로 커밋합니다.
+
+> 📂 운영 흔적은 [`reports/`](./reports) 폴더 — 매일 자동 커밋되는 일자별 리포트로 확인할 수 있습니다.
 
 ## 구성
 
@@ -21,9 +23,10 @@
 |---|---|---|
 | `SLACK_WEBHOOK_URL` | ✅ | Slack → Your Apps → Incoming Webhooks |
 | `DEEPL_API_KEY` | ✅ | https://www.deepl.com/pro-api (Free tier 500,000 chars/월) |
+| `GH_API_TOKEN` | ✅ | GitHub fine-grained PAT (public_repo read) — GitHub Discussions 조회용 |
 | `STACK_EXCHANGE_KEY` | ⚪ 선택 | https://stackapps.com/apps/oauth/register (쿼터 10,000/일) |
 
-`GITHUB_TOKEN`은 Actions가 자동 주입 → 별도 등록 불필요.
+`GITHUB_TOKEN`은 Actions가 자동 주입 → 레포 자동 커밋용. Discussions GraphQL 조회는 별도 `GH_API_TOKEN` 필요.
 
 ### 3. 수동 실행 테스트
 Actions 탭 → `Daily Dev Trends` → `Run workflow` 버튼.
@@ -66,9 +69,11 @@ score = log10(upvotes+1) * 1.0
 
 ## 소스별 주의사항
 
-### Reddit
-- 인증 없이 `hot.json` 사용. User-Agent 고정.
-- Actions 공용 IP에서 429 발생 시 Reddit App 등록 후 OAuth `client_credentials` 전환 필요.
+### Hacker News
+- Firebase REST API (`https://hacker-news.firebaseio.com/v0`) 사용. 인증 불필요.
+- `topstories.json`에서 상위 ID 풀을 받아 `item/{id}.json`으로 상세를 병렬 fetch (`ThreadPoolExecutor`).
+- 본문은 self-post의 `text` 우선, 없으면 top-level 댓글로 대체.
+- Rate limit 사실상 없음. `User-Agent` 헤더만 고정.
 
 ### Stack Overflow
 - Stack Exchange API는 `sort=hot` 지원. 비인증 쿼터 300/일.
@@ -77,7 +82,7 @@ score = log10(upvotes+1) * 1.0
 ### GitHub Discussions
 - REST Search에는 discussion 타입이 없어 **GraphQL Search**를 사용.
 - 필터: 최근 3일 내 업데이트 + 댓글 ≥20 + 최신순.
-- 공개 Discussion만 대상. `GITHUB_TOKEN`으로 공개 데이터 조회 가능.
+- 공개 Discussion만 대상. `GH_API_TOKEN`으로 공개 데이터 조회 가능.
 - 필터 조정: `fetch_github_discussions()`의 `q` 변수.
 
 ## cron 시간
@@ -91,3 +96,4 @@ GitHub Actions cron은 최대 15분 지연될 수 있음 (정시 보장 X).
 - 개인 페이지(블로그/Notion)에 API 푸시
 - 태그 기반 필터링 (예: Spring, Java, Kubernetes만)
 - 중복 제거 (같은 URL이 여러 번 올라오는 경우 30일 LRU 캐시)
+- LLM 기반 abstractive 요약으로 업그레이드 (`fetch_trends.py`의 `_summarize_with_llm` 스텁 참고)
